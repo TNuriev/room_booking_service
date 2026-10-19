@@ -1,0 +1,131 @@
+package postgres
+
+import (
+	"context"
+
+	"room-booking-service-go/internal/repo"
+)
+
+type bookingsRepo struct {
+	queries queryRunner
+}
+
+func (r *bookingsRepo) Create(ctx context.Context, params repo.CreateBookingParams) (repo.Booking, error) {
+	row := r.queries.queryRow(ctx, `
+		INSERT INTO bookings (slot_id, user_id, status, conference_link)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id, slot_id, user_id, status, conference_link, created_at
+	`, params.SlotID, params.UserID, params.Status, params.ConferenceLink)
+
+	item, err := scanBooking(row)
+	if err != nil {
+		return repo.Booking{}, err
+	}
+	return item, nil
+}
+
+func (r *bookingsRepo) GetByID(ctx context.Context, id string) (repo.Booking, error) {
+	row := r.queries.queryRow(ctx, `
+		SELECT id, slot_id, user_id, status, conference_link, created_at
+		FROM bookings
+		WHERE id = $1
+	`, id)
+
+	return scanBooking(row)
+}
+
+func (r *bookingsRepo) List(ctx context.Context, params repo.ListBookingsParams) ([]repo.Booking, int, error) {
+	page := params.Page
+	if page < 1 {
+		page = 1
+	}
+	pageSize := params.PageSize
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+	offset := (page - 1) * pageSize
+
+	countRow := r.queries.queryRow(ctx, `SELECT COUNT(*) FROM bookings`)
+	var total int
+	if err := countRow.Scan(&total); err != nil {
+		return nil, 0, normalizeError(err)
+	}
+
+	rows, err := r.queries.query(ctx, `
+		SELECT id, slot_id, user_id, status, conference_link, created_at
+		FROM bookings
+		ORDER BY created_at DESC, id DESC
+		LIMIT $1 OFFSET $2
+	`, pageSize, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	items := make([]repo.Booking, 0)
+	for rows.Next() {
+		item, err := scanBooking(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+
+	return items, total, nil
+}
+
+func (r *bookingsRepo) ListByUser(ctx context.Context, params repo.ListBookingsByUserParams) ([]repo.Booking, error) {
+	baseSQL := `
+		SELECT b.id, b.slot_id, b.user_id, b.status, b.conference_link, b.created_at
+		FROM bookings b
+		JOIN slots s ON s.id = b.slot_id
+		WHERE b.user_id = $1
+	`
+
+	var (
+		rows rowsScanner
+		err  error
+	)
+
+	if params.From != nil {
+		rows, err = r.queries.query(ctx, baseSQL+` AND s.start_at >= $2 ORDER BY s.start_at ASC, b.id ASC`, params.UserID, params.From.UTC())
+	} else {
+		rows, err = r.queries.query(ctx, baseSQL+` ORDER BY s.start_at ASC, b.id ASC`, params.UserID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]repo.Booking, 0)
+	for rows.Next() {
+		item, err := scanBooking(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return items, nil
+}
+
+func (r *bookingsRepo) Cancel(ctx context.Context, id string) (repo.Booking, error) {
+	row := r.queries.queryRow(ctx, `
+		UPDATE bookings
+		SET status = 'cancelled'
+		WHERE id = $1
+		RETURNING id, slot_id, user_id, status, conference_link, created_at
+	`, id)
+
+	return scanBooking(row)
+}
